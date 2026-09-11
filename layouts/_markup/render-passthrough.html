@@ -1,4 +1,4 @@
-{{- $opts := dict "output" "htmlAndMathml" "displayMode" (eq .Type "block") "throwOnError" false "strict" false -}}
+{{- $opts := dict "output" "htmlAndMathml" "displayMode" (eq .Type "block") "throwOnError" false "strict" "ignore" -}}
 {{- with try (transform.ToMath .Inner $opts) -}}
   {{- with .Err -}}
     {{- warnf "KaTeX: %s (%s)" . $.Position -}}
