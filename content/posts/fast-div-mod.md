@@ -7,170 +7,176 @@ categories = []
 description = ""
 +++
 
-## 1 算法起源
+本文的 `FastDivmod` 指的是 **CUDA / CUTLASS 里的 `FastDivmod`，它的算法根源是“用预计算的倒数乘法实现整数除法”**，历史可以追溯到 GPU 出现之前。 这里要区分：`FastDivmod` 是代码里的封装名称，背后的算法通常叫 **division by invariant integers** 或 **magic-number division**。
 
-FastDivmod 是快速求商与余数的工程封装名称。其算法基础是 division by invariant integers，即针对常数或运行时保持不变的除数，用预计算乘数与移位替代重复整数除法。
+> Torbjörn Granlund, Peter L. Montgomery: Division by Invariant Integers using Multiplication. PLDI 1994: 61-72
 
-| 时间 | 代表工作 | 意义 |
-|---|---|---|
-| 1973、1976 年 | 固定整数除数的快速除法研究 | 早期针对特定常数的算法 |
-| 1991 年 | Robert Alverson，Integer Division Using Reciprocals | 使用倒数和整数乘法实现除法 |
-| 1994 年 | Torbjörn Granlund、Peter L. Montgomery，Division by Invariant Integers using Multiplication | 系统讨论任意非零常数及运行时不变除数，并介绍 GCC 实现 |
+[1994 年的 PLDI 论文](https://gmplib.org/~tege/divcnst-pldi94.pdf)是经典算法来源，但不是整个思想的最早起点；论文自己引用了更早的研究。
 
-1994 年的 PLDI 论文是经典算法来源，但不是整个思想的最早起点；论文自己引用了更早的研究。这些文献也不能确定 FastDivmod 这一具体类名最早出现在哪个代码仓库。[论文原文](https://gmplib.org/~tege/divcnst-pldi94.pdf)
+它解决的问题是：同一个除数 `d` 被反复使用时，先为 `d` 算好一个整数乘数和移位量，之后通过乘法、移位以及必要的修正，得到**精确的整数商**。余数再算：
 
-## 2 从定点倒数理解乘法除法
+```cpp
+r = n - q * d;
+```
 
-设真正的商为 q，余数为 r，则：
+[CUTLASS](https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/fast_math.h#L368) 把这一思路封装成了 `FastDivmod`。它的 32 位实现核心可以概括为：
 
-$$n=qd+r,\qquad 0\le r<d.$$
+```cpp
+// 预先根据 d 算好 multiplier 和 shift_right
+q = (d == 1) ? n : (__umulhi(n, multiplier) >> shift_right);
+r = n - q * d;
+```
 
-选择缩放倍数 S，用整数 M 表示倒数的近似值 M/S。为了让最终的缩放操作成为右移，取：
+`__umulhi` 取两个 32 位无符号整数乘积的高 32 位。这个简化版本有其输入范围约束，不能直接推广成任意有符号整数除法。此外 CutLASS 推荐：**除数在整个 grid 中不变时，在 host 端预计算，再作为 kernel 参数传进去**。
 
-$$S=2^k.$$
+```cpp
+/// Construct the FastDivmod object, in host code ideally.
+///
+/// This precomputes some values based on the divisor and is computationally expensive.
+```
 
-希望计算：
+我们先用一个十进制例子理解，再对应到 CUDA。
 
-$$\hat q=\left\lfloor\frac{nM}{S}\right\rfloor.$$
+**1. 为什么乘近似倒数，也能得到精确整数商？**
 
-这里用 q 表示真正的商，使用带帽的商表示候选计算结果，避免在证明前就假定两者相等。
+假设要计算 `n / 3`，且 `n` 是 `0～99` 的整数。
 
-例如，除以 3 时用 334/1000 近似 1/3。对于 0 到 99 的整数，乘以 0.334 再向下取整会得到正确整数商。但 n=500 时得到 167，真正的整数商为 166。这个例子说明，近似精度必须与输入范围配合。
+用 `0.334` 近似 `1/3`，可以这样算：
 
-## 3 为什么选择向上取整
+$$
+q=\left\lfloor n\times0.334\right\rfloor
+=\left\lfloor\frac{n\times334}{1000}\right\rfloor
+$$
 
-为保证近似结果不低于真正的 n/d，希望：
+例如：
 
-$$\frac{M}{S}\ge\frac1d\quad\Longleftrightarrow\quad M\ge\frac Sd.$$
+| n  | 真正的 n/3 | n×0.334 | 向下取整 |
+| -- | ------: | ------: | ---: |
+| 8  |  2.666… |   2.672 |    2 |
+| 9  |       3 |   3.006 |    3 |
+| 11 |  3.666… |   3.674 |    3 |
 
-满足这个约束的最小整数为：
+虽然小数部分有误差，**只要误差没有让结果跨过下一个整数，商就完全正确。**
 
-$$\boxed{M=\left\lceil\frac Sd\right\rceil=\left\lceil\frac{2^k}{d}\right\rceil.}$$
+但输入范围很重要：`n = 500` 时，`500 × 0.334 = 167`，真正的整数商却是 `166`。因此要根据输入上限选择倒数精度。
 
-这就是 magic number 公式的来源。向上取整是本算法变体的选择；也存在配合修正操作的向下取整算法。
+**2. 计算机用 \(2^k\) 作为缩放倍数**
 
-由上取整定义：
+这样最后的除法就能用右移完成。预计算：
 
-$$\frac Sd\le M<\frac Sd+1.$$
+$$
+M=\left\lceil\frac{2^k}{d}\right\rceil
+$$
 
-乘以正数 d：
+运行时计算：
 
-$$S\le Md<S+d.$$
+$$
+\boxed{q=(nM)\gg k}
+$$
 
-定义整数误差 e=Md−S，就得到：
+这里的 `M` 就是 **magic number**。它表示放大 \(2^k\) 倍后、向上取整的倒数。
 
-$$Md=S+e,\qquad 0\le e<d.$$
+向上取整可以保证估计结果不会低于真正的 \(n/d\)；再选择足够大的 `k`，保证它不会高到下一个整数。
 
-## 4 误差展开式逐步推导
+**3. 怎样保证误差足够小？**
 
-从 Md=S+e 出发，先解出 M：
+写成：
 
-$$M=\frac{S+e}{d}.$$
+$$
+n=qd+r,\quad 0\le r<d
+$$
 
-代入候选结果取整前的表达式：
+又因为 `M` 向上取整：
 
-$$\frac{nM}{S}=\frac nS\cdot\frac{S+e}{d}
-=\frac{n(S+e)}{dS}
-=\frac{nS}{dS}+\frac{ne}{dS}
-=\frac nd+\frac{ne}{dS}.$$
+$$
+Md=2^k+e,\quad 0\le e<d
+$$
 
-再将 n=qd+r 代入 n/d：
+先从上式解出：
 
-$$\frac nd=\frac{qd+r}{d}=q+\frac rd.$$
+$$
+M=\frac{2^k+e}{d}
+$$
 
-合并即得：
+代入：
 
-$$\boxed{\frac{nM}{S}=q+\frac rd+\frac{ne}{dS}.}$$
+$$
+\begin{aligned}
+\frac{nM}{2^k}
+&=\frac{n(2^k+e)}{d\,2^k}\\
+&=\frac nd+\frac{ne}{d\,2^k}
+\end{aligned}
+$$
 
-三部分依次为真正的整数商、原有的小数部分、近似倒数引入的非负误差。
+又因为真正的整数除法满足：
 
-## 5 从正确商的区间推导误差条件
+$$
+n=qd+r
+\quad\Rightarrow\quad
+\frac nd=q+\frac rd
+$$
 
-要使候选商等于真正的商，取整前的值必须位于同一个整数区间：
+于是：
 
-$$\hat q=q\quad\Longleftrightarrow\quad q\le\frac{nM}{S}<q+1.$$
+$$
+\frac{nM}{2^k}
+=q+\underbrace{\frac rd}_{原有小数部分}
++\underbrace{\frac{ne}{d\,2^k}}_{近似误差}
+$$
 
-因为余数和误差非负，下界自动成立。只需保证上界：
+最坏情况下，原有小数部分是 \((d-1)/d\)，距离下一个整数还有 \(1/d\)。
 
-$$\frac rd+\frac{ne}{dS}<1.$$
+因此，只要：
 
-两侧乘以正数 dS：
+$$
+\frac{ne}{d\,2^k}<\frac1d
+\quad\Longleftrightarrow\quad
+\boxed{ne<2^k}
+$$
 
-$$rS+ne<dS\quad\Longleftrightarrow\quad\boxed{ne<(d-r)S.}$$
+就能保证向下取整后仍然是 `q`。这是一个充分条件。
 
-这是在上述定义下，针对某个输入 n 的精确正确性条件。但预计算时不希望依赖每个输入的余数 r。
+对于 CUTLASS 常见的非负 `int` 索引，即 \(n<2^{31}\)，可以取：
 
-因为 r≤d−1，所以 d−r≥1。用最小间隔代替实际间隔，可以采用更强而更容易验证的条件：
+$$
+L=\lceil\log_2d\rceil,\qquad k=31+L
+$$
 
-$$\boxed{ne<S=2^k.}$$
+由于 $e<d\le2^L$，自然有：
 
-它是充分条件，不是必要条件：即使不满足，某些输入仍可能算对，只是这条保守证明不再提供保证。
+$$
+ne<2^{31}\cdot2^L=2^k
+$$
 
-## 6 如何选取 k
+这就是那套参数选择背后的数学依据。
 
-假设所有输入均满足：
+**4. 对应到 CUDA 代码**
 
-$$0\le n<2^B.$$
+以除以 `10` 为例：
 
-选择：
+$$
+k=31+\lceil\log_2 10\rceil=35
+$$
 
-$$L=\lceil\log_2d\rceil,\qquad k=B+L.$$
+$$
+M=\left\lceil\frac{2^{35}}{10}\right\rceil
+=3435973837=\texttt{0xCCCCCCCD}
+$$
 
-因为 e<d≤2^L，因此：
-
-$$ne<2^B\cdot2^L=2^{B+L}=2^k.$$
-
-于是能够保证规定范围内每个输入都得到正确结果。该选择是简单的充分方案，不一定是某个除数所需的最小 k。
-
-CUTLASS 常见非负 int 索引的上限为 2³¹，所以取 B=31，得到：
-
-$$k=31+\lceil\log_2d\rceil.$$
-
-在 2≤d≤2³¹−1 的范围内，令 L=ceil(log₂d)，有 d>2^(L−1)，从而 2^(31+L)/d<2³²；再利用整数 d≥2^(L−1)+1，可保证上取整后的 M 仍能放入 uint32_t。d=1 单独处理。
-
-## 7 从数学表达式到 CUDA 指令
-
-对非负整数，右移 k 位等于除以 2^k 后向下取整，因此：
-
-$$\boxed{q=\left\lfloor\frac{nM}{2^k}\right\rfloor=(nM)\gg k.}$$
-
-这里的乘积必须完整保留需要的高位，不能先用 32 位乘法截断再右移。
-
-以除以 10 为例：
-
-$$L=4,\quad k=35,\quad M=\left\lceil\frac{2^{35}}{10}\right\rceil=3435973837.$$
-
-M 的十六进制表示为 0xCCCCCCCD。可写为：
+于是可以精确计算：
 
 ```cpp
 uint32_t q = (uint64_t(n) * 0xCCCCCCCDu) >> 35;
 uint32_t r = n - q * 10;
 ```
 
-__umulhi 返回两个 32 位无符号整数乘积的高 32 位：
-
-$$\operatorname{umulhi}(n,M)=\left\lfloor\frac{nM}{2^{32}}\right\rfloor.$$
-
-对整数乘积，先右移 32 位再右移 3 位，与一次右移 35 位相同。因此代码可改为：
+CUDA 的 `__umulhi` 直接取 32 位整数乘积的高 32 位，相当于先右移 32 位，所以代码变成：
 
 ```cpp
 uint32_t q = __umulhi(n, 0xCCCCCCCDu) >> 3;
 uint32_t r = n - q * 10;
 ```
 
-一般情况下，设备端右移量为 k−32=L−1。余数公式直接来自 n=qd+r，两侧减去 qd 即得 r=n−qd。
+对于不同的除数，提前计算对应的 `M` 和移位量即可。完整无符号范围、负数等情况，可能需要其他参数或额外修正。
 
-## 8 性能意义与适用边界
-
-当除数是一次 kernel 调用中保持不变的张量维度时，可以在 host 端计算 M 和移位量，再让大量线程复用。初始化本身仍可能需要除法，但它的成本被后续大量计算摊薄。[CUTLASS 源码](https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/fast_math.h)
-
-本推导面向非负输入和正除数。d=0 不合法，d=1 可直接返回原数和零余数。完整 uint32_t 范围、负数或更宽输入需要相应的参数、位宽处理或修正算法。某些除数的参数可能在更大范围内也成立，但不能据此扩大整个简化实现的保证范围。
-
-当除数每次变化时，预计算成本可能抵消收益；当除数在编译时已知时，编译器通常可以自行进行相关优化，显式对象的主要价值在于运行时确定但反复使用的除数。
-
-## 参考资料
-
-1. Granlund 与 Montgomery，1994，Division by Invariant Integers using Multiplication：https://gmplib.org/~tege/divcnst-pldi94.pdf
-2. NVIDIA CUTLASS，include/cutlass/fast_math.h：https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/fast_math.h
-3. Yifei Li，Classic Round-Up Variant of Fast Unsigned Division by Constants Algorithm and Full Proof：https://arxiv.org/pdf/2412.03680
-
+**它快的关键是复用预计算结果。** 比如一个 kernel 中所有线程都用同一个张量维度 `d` 做索引转换：只需初始化一次，之后每次求商和余数都用乘法、移位和减法完成。
