@@ -120,8 +120,8 @@ $$
 
 $$
 \frac{nM}{2^k}
-=q+\underbrace{\frac rd}_{原有小数部分}
-+\underbrace{\frac{ne}{d\,2^k}}_{近似误差}
+=q+\underbrace{\frac rd}_{\text{原有小数部分}}
++\underbrace{\frac{ne}{d\,2^k}}_{\text{近似误差}}
 $$
 
 最坏情况下，原有小数部分是 \((d-1)/d\)，距离下一个整数还有 \(1/d\)。
