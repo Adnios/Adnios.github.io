@@ -32,6 +32,7 @@ pagination.pagerSize = 10
   disableSpecial1stPost = false
   hideSummary = false
   comments = false
+  math = true
 
   [params.homeInfoParams]
     Title = "你好，我是 Adnios 👋"
@@ -95,3 +96,8 @@ pagination.pagerSize = 10
     guessSyntax = true
     lineNos = false
     style = "monokai"
+  [markup.goldmark.extensions.passthrough]
+    enable = true
+    [markup.goldmark.extensions.passthrough.delimiters]
+      block = [['\[', '\]'], ['$$', '$$']]
+      inline = [['\(', '\)'], ['$', '$']]
